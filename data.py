@@ -1,211 +1,216 @@
-import torch
 import pandas as pd
 import re
-import numpy as np
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm import tqdm
-import textstat  # для метрик читаемости
+import numpy as np
 
 # ===================== Настройки =====================
 OUTPUT_FILE = "filtered_wb_feedbacks.parquet"
-SAIGA_MODEL = "IlyaGusev/saiga_yandexgpt_8b"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-MAX_ROWS = 10000  # начать с меньшего количества для тестирования
+MAX_ROWS = 192000000
 
-# ===================== Rule-Based Фильтрация =====================
-def rule_based_filtering(df):
-    """
-    Быстрая фильтрация по правилам - эффективно отсеивает мусор
-    """
-    keep_mask = []
+# ===================== Функция очистки от персональных данных =====================
+def remove_personal_data(text):
+    """Удаляет имена, фамилии и другие персональные данные"""
+    if not isinstance(text, str):
+        return text
     
-    for _, row in df.iterrows():
-        review = str(row['text'])
-        answer = str(row['answer'])
+    # Удаляем имена в формате "Имя, добрый день"
+    text = re.sub(r'^[А-ЯЁ][а-яё]+[,!.]?\s+(добрый|привет|здравствуйте|извините)', '', text, flags=re.IGNORECASE)
+    
+    # Удаляем обращения с именами
+    text = re.sub(r'(уважаемы[ей]|дорог[ойая])\s+[А-ЯЁ][а-яё]+', '', text, flags=re.IGNORECASE)
+    
+    # Удаляем email адреса
+    text = re.sub(r'\S+@\S+', '[EMAIL]', text)
+    
+    # Удаляем номера телефонов
+    text = re.sub(r'(\+7|8)[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{2}[\s\-\(\)]*\d{2}', '[PHONE]', text)
+    
+    return text.strip()
+
+# ===================== Умная фильтрация =====================
+def smart_filtering(df):
+    """Умная фильтрация, которая убирает рекламу и шаблонные ответы"""
+    print("Запуск умной фильтрации...")
+
+    results = []
+    cleaned_texts = []
+    cleaned_answers = []
+
+    # Расширенный список стоп-слов для рекламы
+    ad_phrases = [
+        # Прямые призывы
+        'ждем вас снова', 'ждём вас снова',
+        'ждем за покупками', 'ждём за покупками',
+        'приятных покупок', 'надеемся увидеть вас снова',
+        'с надеждой видеть', 'будем рады видеть',
+        'ждем в нашем магазине', 'ждём в нашем магазине',
+        'покупай', 'заказывай', 'приобретай',
         
-        # Пропускаем пустые или почти пустые
-        if len(review.strip()) < 5 or len(answer.strip()) < 3:
-            keep_mask.append(False)
+        # Рекламные маркеры
+        'скидк', 'выгодн', 'акци', 'специальное предложение',
+        'лучшее предложение', 'успейте заказать', 'успейте купить',
+        'подарок каждому', 'каталог', 'ассортимент',
+        
+        # Замаскированные советы
+        'рекомендуем попробовать', 'советуем попробовать',
+        'обратите внимание на', 'посмотрите также',
+        
+        # Продавец сам себя хвалит
+        'наши сотрудники', 'наши подруги', 'мы уверены что',
+        'уверены что вы сможете подобрать'
+    ]
+
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Умная фильтрация"):
+        original_text = str(row['text'])
+        original_answer = str(row['answer'])
+
+        # Очищаем от персональных данных
+        cleaned_text = remove_personal_data(original_text)
+        cleaned_answer = remove_personal_data(original_answer)
+
+        # Пропускаем пустые
+        if len(cleaned_text) < 10 or len(cleaned_answer) < 10:
+            results.append(False)
+            cleaned_texts.append(cleaned_text)
+            cleaned_answers.append(cleaned_answer)
             continue
-        
-        # Критерии отсеивания
-        should_reject = (
-            len(answer) > 500 or  # Слишком длинные ответы
-            len(answer) < 10 or  # Слишком короткие ответы
-            re.search(r'http|www|\.ru|\.com|\.net|\.org', answer.lower()) or  # Ссылки
-            re.search(r'[0-9]{10,}', answer) or  # Телефоны/номера
-            re.search(r'[a-f0-9]{32}', answer) or  # Хэши
-            any(phrase in answer.lower() for phrase in [
-                'спасибо за отзыв', 'благодарим за отзыв', 'извините за',
-                'приносим извинения', 'обратитесь в поддержку', 'напишите нам',
-                'позвоните нам', 'контактный телефон'
-            ]) or
-            answer.lower().strip() in ['ok', 'хорошо', 'понятно', 'ясно', 'спасибо', 'благодарю'] or
-            len(set(answer)) < 5  # Мало уникальных символов
+
+        answer_lower = cleaned_answer.lower()
+
+        # 1. ЖЕСТКИЕ КРИТЕРИИ ОТСЕИВАНИЯ (реклама, шаблоны)
+        is_advertisement = (
+            re.search(r'арт\.\s*\d+|артикул\s*\d+', answer_lower) or
+            re.search(r'рекомендуем.*\d+|предлагаем.*\d+', answer_lower) or
+            re.search(r'[#№]\d+', answer_lower) or
+            any(phrase in answer_lower for phrase in ad_phrases)
         )
-        
-        keep_mask.append(not should_reject)
-    
-    return df[keep_mask]
-
-# ===================== Heuristic Фильтрация =====================
-def heuristic_filtering(df):
-    """
-    Фильтрация на основе статистических метрик и эвристик
-    """
-    keep_mask = []
-    
-    for _, row in df.iterrows():
-        answer = str(row['answer'])
-        
-        # Пропускаем слишком короткие
-        if len(answer) < 15:
-            keep_mask.append(False)
-            continue
-        
-        # Вычисляем метрики
-        words = answer.split()
-        word_count = len(words)
-        unique_words = len(set(words))
-        diversity_ratio = unique_words / word_count if word_count > 0 else 0
-        
-        # Простые метрики качества
-        has_questions = any('?' in word for word in words)
-        has_explanations = any(len(word) > 8 for word in words)  # Длинные слова часто содержат смысл
-        sentence_count = answer.count('.') + answer.count('!') + answer.count('?')
-        
-        # Композитный скоринг
-        score = (
-            min(len(answer), 200) / 200 * 0.2 +  # Длина ответа
-            min(diversity_ratio * 2, 1) * 0.3 +  # Разнообразие слов
-            (1 if has_questions else 0) * 0.1 +  # Вопросы - признак диалога
-            (1 if has_explanations else 0) * 0.2 +  # Объяснения
-            min(sentence_count / 5, 1) * 0.2  # Количество предложений
+        is_template = (
+            len(cleaned_answer) < 25 or
+            answer_lower.startswith(('спасибо', 'благодар', 'извин')) and len(cleaned_answer) < 50 or
+            any(phrase in answer_lower for phrase in [
+                'спасибо за отзыв', 'благодарим за отзыв', 'обратитесь в поддержку',
+                'напишите нам', 'позвоните нам', 'контактный телефон',
+                'ваш отзыв очень важен', 'будем рады помочь', 'приносим извинения'
+            ])
         )
-        
-        keep_mask.append(score > 0.5)  # Пороговое значение
-    
-    return df[keep_mask]
 
-# ===================== Ensemble Фильтрация =====================
-def ensemble_filtering(df):
-    """
-    Комбинированная фильтрация - самый надежный метод
-    """
-    print("Начало многоступенчатой фильтрации...")
-    
-    # Первый проход: быстрая rule-based фильтрация
-    df_filtered_1 = rule_based_filtering(df)
-    print(f"После rule-based: {len(df_filtered_1)} строк")
-    
-    # Второй проход: статистическая фильтрация
-    df_filtered_2 = heuristic_filtering(df_filtered_1)
-    print(f"После heuristic: {len(df_filtered_2)} строк")
-    
-    return df_filtered_2
+        has_junk = (
+            re.search(r'http|www|\.ru|\.com', cleaned_answer) or
+            re.search(r'[0-9]{10,}', cleaned_answer) or
+            '[EMAIL]' in cleaned_answer or
+            '[PHONE]' in cleaned_answer
+        )
 
-# ===================== Функция классификации Saiga (опционально) =====================
-def classify_with_saiga(df, sample_size=1000):
-    """
-    Дополнительная фильтрация с помощью Saiga для небольшой выборки
-    """
-    if len(df) == 0:
-        return df
-    
-    # Берем выборку для финальной проверки
-    sample_df = df.sample(min(sample_size, len(df)), random_state=42)
-    
-    print(f"Загружаем Saiga для финальной проверки {len(sample_df)} строк...")
-    
-    tokenizer = AutoTokenizer.from_pretrained(SAIGA_MODEL, use_fast=False)
-    model = AutoModelForCausalLM.from_pretrained(
-        SAIGA_MODEL,
-        torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-        device_map="auto",
-        low_cpu_mem_usage=True
-    )
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    
-    keep_mask = []
-    
-    for _, row in tqdm(sample_df.iterrows(), total=len(sample_df), desc="Saiga проверка"):
-        review = str(row['text'])
-        answer = str(row['answer'])
-        
-        prompt = f"""Определи, является ли следующий ответ качественным и содержательным для обучения AI-ассистента:
+        # 2. КРИТЕРИИ КАЧЕСТВЕННОГО ОТВЕТА
+        text_words = set(word for word in cleaned_text.lower().split() if len(word) > 4)
+        answer_words = set(cleaned_answer.lower().split())
+        common_words = text_words & answer_words
+        has_relevance = len(common_words) > 0
 
-Отзыв: "{review[:100]}"
-Ответ: "{answer[:200]}"
+        has_quality = (
+            len(cleaned_answer.split()) > 8 and  # Не менее 9 слов
+            any(char in cleaned_answer for char in '.!?') and  # Есть пунктуация
+            any(word in answer_lower for word in [  # Содержит полезные слова
+                'качеств', 'доставк', 'размер', 'цвет', 'материал',
+                'гаранти', 'обмен', 'возврат', 'рекоменд', 'совету',
+                'проблем', 'решен', 'изменен', 'улучшен', 'исправлен'
+            ]) and
+            # НЕ содержит рекламных фраз
+            not any(ad_phrase in answer_lower for ad_phrase in ['купит', 'заказ', 'покупк', 'магазин', 'ассортимент'])
+        )
 
-Ответ должен быть только 'true' или 'false':"""
-        
-        inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(DEVICE)
-        
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=10,
-                do_sample=False,
-                temperature=0.0,
-                pad_token_id=tokenizer.eos_token_id
-            )
-        
-        generated_text = tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
-        is_good = 'true' in generated_text.lower()
-        keep_mask.append(is_good)
+        # 3. ФИНАЛЬНОЕ РЕШЕНИЕ - жестко отсеиваем рекламу
+        should_keep = (
+            has_relevance and
+            has_quality and
+            not is_template and
+            not has_junk and
+            not is_advertisement
+        )
+
+        results.append(should_keep)
+        cleaned_texts.append(cleaned_text)
+        cleaned_answers.append(cleaned_answer)
+
+    # Создаем новый DataFrame с очищенными данными
+    filtered_df = df.copy()
+    filtered_df['text_cleaned'] = cleaned_texts
+    filtered_df['answer_cleaned'] = cleaned_answers
+    filtered_df = filtered_df[results]
+
+    return filtered_df
+
+# ===================== Показ реальных примеров =====================
+def show_real_examples(original_df, filtered_df, num_examples=5):
+    """Показывает реальные примеры до и после"""
+    print(f"\n=== РЕАЛЬНЫЕ ПРИМЕРЫ (из {len(filtered_df)} отфильтрованных) ===")
     
-    # Применяем результаты к выборке
-    sample_df = sample_df[pd.Series(keep_mask, index=sample_df.index)]
-    
-    # Объединяем с остальными данными
-    remaining_df = df[~df.index.isin(sample_df.index)]
-    final_df = pd.concat([sample_df, remaining_df])
-    
-    return final_df
+    if len(filtered_df) > 0:
+        sample_indices = np.random.choice(len(filtered_df), min(num_examples, len(filtered_df)), replace=False)
+        
+        for i, idx in enumerate(sample_indices):
+            filtered_row = filtered_df.iloc[idx]
+            original_idx = filtered_row.name
+            
+            if original_idx in original_df.index:
+                original_row = original_df.loc[original_idx]
+                
+                print(f"\n--- Пример {i+1} ---")
+                print(f"📝 БЫЛО - Отзыв: {original_row['text']}")
+                print(f"💬 БЫЛО - Ответ: {original_row['answer']}")
+                print(f"✨ СТАЛО - Отзыв: {filtered_row['text_cleaned']}")
+                print(f"✅ СТАЛО - Ответ: {filtered_row['answer_cleaned']}")
+                
+                # Анализ почему сохранили/отсеяли
+                answer_lower = filtered_row['answer_cleaned'].lower()
+                if any(word in answer_lower for word in ['качеств', 'гаранти', 'рекоменд']):
+                    print("🔍 Сохранен: содержит полезную информацию о качестве")
+                elif any(word in answer_lower for word in ['проблем', 'решен', 'исправлен']):
+                    print("🔍 Сохранен: описывает решение проблемы")
+                elif len(filtered_row['answer_cleaned'].split()) > 12:
+                    print("🔍 Сохранен: развернутый содержательный ответ")
+                else:
+                    print("🔍 Сохранен: релевантный ответ без рекламы")
+                
+                print("-" * 80)
 
 # ===================== Главная функция =====================
 def main():
     print("Загружаем wb-feedbacks...")
-    try:
-        wb = load_dataset("nyuuzyou/wb-feedbacks", split="train")
-        wb = wb.filter(lambda x: (x.get("text") or "") != "" and (x.get("answer") or "") != "")
+    
+    # Загрузка данных
+    wb = load_dataset("nyuuzyou/wb-feedbacks", split="train")
+    wb = wb.filter(lambda x: (x.get("text") or "") != "" and (x.get("answer") or "") != "")
+    
+    if len(wb) > MAX_ROWS:
+        wb = wb.select(range(MAX_ROWS))
+    
+    original_df = pd.DataFrame(wb)
+    print(f"Загружено {len(original_df)} строк")
+    
+    # Умная фильтрация
+    filtered_df = smart_filtering(original_df)
+    print(f"После фильтрации: {len(filtered_df)} строк")
+    
+    # Показываем реальные примеры
+    show_real_examples(original_df, filtered_df)
+    
+    if len(filtered_df) > 0:
+        # Сохранение
+        filtered_df['formatted_text'] = "Отзыв: " + filtered_df['text_cleaned'] + "\nОтвет: " + filtered_df['answer_cleaned']
+        filtered_df.to_parquet(OUTPUT_FILE, index=False)
+        print(f"\n✅ Сохранено {len(filtered_df)} качественных строк в {OUTPUT_FILE}")
         
-        # Ограничиваем количество строк
-        if len(wb) > MAX_ROWS:
-            wb = wb.select(range(MAX_ROWS))
-        
-        wb_df = pd.DataFrame(wb)
-        print(f"Обрабатываем {len(wb_df)} строк...")
-        
-        # Многоступенчатая фильтрация
-        filtered_df = ensemble_filtering(wb_df)
-        
-        # Опционально: дополнительная проверка Saiga для небольшой выборки
-        if len(filtered_df) > 1000:
-            filtered_df = classify_with_saiga(filtered_df, sample_size=500)
-        
-        print(f"После всей фильтрации: {len(filtered_df)} строк")
-        
-        if len(filtered_df) > 0:
-            # Подготовка для обучения
-            filtered_df["formatted_text"] = "Отзыв: " + filtered_df["text"] + "\nОтвет: " + filtered_df["answer"]
-            
-            # Сохраняем полные данные и отформатированные
-            filtered_df.to_parquet(OUTPUT_FILE, index=False)
-            print(f"✅ Сохранено {len(filtered_df)} строк в {OUTPUT_FILE}")
-            
-            # Дополнительно сохраняем только текст для обучения
-            filtered_df[["formatted_text"]].to_parquet("training_data.parquet", index=False)
-            print("✅ Сохранены данные для обучения")
-        else:
-            print("❌ Нет подходящих данных для сохранения")
-            
-    except Exception as e:
-        print(f"Ошибка: {e}")
-        import traceback
-        traceback.print_exc()
+        # Статистика
+        print(f"\n📊 Статистика:")
+        print(f"Исходно: {len(original_df)} строк")
+        print(f"После фильтрации: {len(filtered_df)} строк")
+        print(f"Процент сохраненных: {len(filtered_df)/len(original_df)*100:.1f}%")
+        print(f"🚫 Отсеяно рекламы и шаблонов: {len(original_df) - len(filtered_df)} строк")
+    
+    else:
+        print("❌ Не осталось данных после фильтрации")
 
 if __name__ == "__main__":
     main()
