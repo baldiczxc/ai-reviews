@@ -1,2 +1,3 @@
 /venv
 filtered_wb_feedbacks.parquet
+output.log
